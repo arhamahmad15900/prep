@@ -8,8 +8,8 @@ let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
 // Set model targets
-const PRIMARY_MODEL = "gemini-3.6-flash";
-const FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-1.5-flash-8b"];
+const PRIMARY_MODEL = "gemini-1.5-flash";
+const FALLBACK_MODELS = ["gemini-1.5-flash-8b"];
 
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
@@ -45,7 +45,7 @@ function isQuotaOrRateLimitError(err: any): boolean {
   );
 }
 
-// Retries primary model (gemini-3.6-flash) and falls back to backup models on quota errors
+// Retries primary model (gemini-1.5-flash) and falls back to backup models on quota errors
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
   const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
 
