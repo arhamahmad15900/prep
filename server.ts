@@ -142,7 +142,7 @@ async function startServer() {
         const randomEntropyKey = `SESSION_${timestamp}_VARIATION_${seed}_BATCH_${batchIdx + 1}_RND_${Math.floor(Math.random() * 1000000)}`;
 
         const instructions = `You are a Master Professor of Formal Logic, Analytical Aptitude, and NIELIT 'O' Level Examination Question Setter.
-Carefully read and comprehend every premise, rule, definition, classification, and logical relationship in the provided study notes.
+Carefully read and comprehend every premise, rule, definition, classification, and logical relationship in the provided study notes. You must ONLY use thess information provided in the study notes to generate the questions and answers.Do not use any external or general knowledge.
 
 Task:
 Synthesize exactly ${bCount} authentic, NIELIT 'O' Level difficulty Multiple Choice Questions (MCQs) (Batch ${batchIdx + 1} of ${totalBatches}) directly based on or inspired by the logical concepts, arguments, problems, and structures in the attached notes.
