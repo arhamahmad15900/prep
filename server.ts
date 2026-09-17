@@ -19,7 +19,7 @@ function getAIClient(): GoogleGenAI {
     }
     aiClient = new GoogleGenAI({
       apiKey,
-      apiVersion:'v1',
+      apiVersion:'v1beta',
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
