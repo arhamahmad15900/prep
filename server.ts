@@ -7,6 +7,9 @@ import { liveTestStore } from "./server/liveTestManager.js";
 let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
+// Primary model for generation with high free-tier limits
+const MODEL_NAME = "gemini-1.5-flash";
+
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -27,7 +30,6 @@ function getAIClient(): GoogleGenAI {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Helper to check if error is rate limit / quota exhaustion
 function isQuotaOrRateLimitError(err: any): boolean {
   if (!err) return false;
   const status = err.status || err.code || err.error?.code;
@@ -42,23 +44,22 @@ function isQuotaOrRateLimitError(err: any): boolean {
   );
 }
 
-// Controlled retry logic that respects Render's 60-second HTTP proxy timeout
+// Retries API calls up to 2 times, avoiding Render's 60-second HTTP proxy timeout
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await ai.models.generateContent({ ...params, model: "gemini-3.6-flash" });
+      return await ai.models.generateContent({ ...params, model: MODEL_NAME });
     } catch (err: any) {
       const errStr = (err?.message || err?.error?.message || "").toLowerCase();
       const is429 = isQuotaOrRateLimitError(err);
       const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
 
       if ((is429 || is503) && attempt < maxRetries) {
-        let waitMs = 8000;
+        let waitMs = 5000;
 
         const match = errStr.match(/retry in ([0-9.]+)s/);
         if (match && match[1]) {
           const reqWaitSec = parseFloat(match[1]);
-          // Abort wait if Google demands > 15s to keep request safe from Render 60s timeout
           if (reqWaitSec > 15) {
             console.warn(`[WARN] Required wait (${reqWaitSec}s) exceeds safe threshold. Triggering fallback.`);
             throw err;
@@ -66,7 +67,7 @@ async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): 
           waitMs = Math.ceil(reqWaitSec * 1000) + 1000;
         }
 
-        console.warn(`[WARN] API busy/rate-limited. Pausing ${Math.ceil(waitMs / 1000)}s before retry ${attempt + 1}/${maxRetries}...`);
+        console.warn(`[WARN] API rate-limited (${MODEL_NAME}). Waiting ${Math.ceil(waitMs / 1000)}s before retry ${attempt + 1}/${maxRetries}...`);
         await sleep(waitMs);
       } else {
         throw err;
@@ -83,12 +84,10 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Health check
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
-  // Multimodal Gemini AI Endpoint: Read PDF notes and generate Logical Reasoning MCQs
   app.post("/api/generate-pdf-reasoning-questions", async (req, res) => {
     const { pdfBase64, count = 50, timestamp = Date.now(), seed = Math.random().toString() } = req.body;
     const requestedTotal = Math.min(Math.max(Number(count) || 10, 5), 100);
@@ -134,7 +133,7 @@ async function startServer() {
 
       const generateBatch = async (bCount: number, batchIdx: number): Promise<any[]> => {
         if (Date.now() < quotaExhaustedUntil) {
-          console.warn(`[WARN] Quota exhausted. Skipping API request for batch ${batchIdx + 1} and using fallback.`);
+          console.warn(`[WARN] Quota exhausted. Skipping API call for batch ${batchIdx + 1} and using fallback.`);
           return getResilientReasoningQuestions(bCount);
         }
 
@@ -171,13 +170,11 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         let resp: any = null;
 
         try {
-          console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches}`);
+          console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches} with model: ${MODEL_NAME}`);
           resp = await generateWithRetry(ai, {
-            contents: {
-              parts: contentsParts
-            },
+            contents: { parts: contentsParts },
             config: {
-              temperature: 0.9,
+              temperature: 0.8,
               responseMimeType: "application/json",
               responseSchema: {
                 type: Type.ARRAY,
@@ -208,7 +205,7 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         } catch (err: any) {
           console.error(`[ERROR] Gemini generation failed for batch ${batchIdx + 1}:`, err?.message || err);
           if (isQuotaOrRateLimitError(err)) {
-            quotaExhaustedUntil = Date.now() + 60 * 1000; // Trigger 60s cooldown across all batches
+            quotaExhaustedUntil = Date.now() + 60 * 1000;
             console.warn(`[WARN] Quota cooldown set until ${new Date(quotaExhaustedUntil).toLocaleTimeString()}`);
           }
           return getResilientReasoningQuestions(bCount);
@@ -235,8 +232,8 @@ Return ONLY a JSON array adhering strictly to the schema.`;
             allResults.push(...getResilientReasoningQuestions(batchCounts[i]));
             continue;
           }
-          console.log(`[INFO] Pacing request... waiting 3s before requesting batch ${i + 1}`);
-          await sleep(3000);
+          console.log(`[INFO] Pacing request... waiting 2s before requesting batch ${i + 1}`);
+          await sleep(2000);
         }
         const batchQuestions = await generateBatch(batchCounts[i], i);
         allResults.push(...batchQuestions);
@@ -261,7 +258,6 @@ Return ONLY a JSON array adhering strictly to the schema.`;
     }
   });
 
-  // AI-powered NIELIT O-Level question generation endpoint
   app.post("/api/generate-ai-questions", async (req, res) => {
     try {
       const { moduleCode, moduleTitle, chapterName, count = 5, topic } = req.body;
