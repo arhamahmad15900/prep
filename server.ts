@@ -8,7 +8,7 @@ let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
 // Set model targets with gemini-1.5-pro as fallback
-const PRIMARY_MODEL = "gemini-3.6-flash";
+const PRIMARY_MODEL = "gemini-1.5-flash";
 const FALLBACK_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash-8b"];
 
 function getAIClient(): GoogleGenAI {
@@ -714,5 +714,11 @@ Strict Requirements:
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
+async function listAvailableModels() {
+  const client = getAIClient();
+  const models = await client.models.list();
+  console.log(models);
+}
+listAvailableModels();
 
 startServer();
