@@ -7,9 +7,9 @@ import { liveTestStore } from "./server/liveTestManager.js";
 let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
-// Configured Primary Model: Gemini 2.5 Flash
-const PRIMARY_MODEL = "gemini-2.5-flash";
-const FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash-8b"];
+// Set model targets
+const PRIMARY_MODEL = "gemini-3.6-flash";
+const FALLBACK_MODELS = ["gemini-1.5-flash", "gemini-1.5-flash-8b"];
 
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
@@ -45,14 +45,14 @@ function isQuotaOrRateLimitError(err: any): boolean {
   );
 }
 
-// Executes request on gemini-2.5-flash with fallback cascade
+// Retries primary model (gemini-3.6-flash) and falls back to backup models on quota errors
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
   const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
 
   for (const modelName of modelsToTry) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        console.log(`[DEBUG] Requesting with model: ${modelName} (Attempt ${attempt})`);
+        console.log(`[DEBUG] Attempting generation with model: ${modelName} (Attempt ${attempt})`);
         return await ai.models.generateContent({ ...params, model: modelName });
       } catch (err: any) {
         const errStr = (err?.message || err?.error?.message || "").toLowerCase();
@@ -63,15 +63,15 @@ async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): 
           console.warn(`[WARN] Model ${modelName} rate limited. Retrying attempt ${attempt + 1}/${maxRetries}...`);
           await sleep(2000);
         } else if (is429 || is503) {
-          console.warn(`[WARN] Quota or limit reached on ${modelName}. Falling back to next model...`);
-          break;
+          console.warn(`[WARN] Quota exhausted on ${modelName}. Cascading to fallback model...`);
+          break; // Switch to the next available model
         } else {
           throw err;
         }
       }
     }
   }
-  throw new Error("All configured Gemini AI models failed or hit rate limits.");
+  throw new Error("All AI models failed or exceeded quota limits.");
 }
 
 async function startServer() {
@@ -107,7 +107,6 @@ async function startServer() {
 
       const ai = getAIClient();
 
-      // Clean Base64 Data URL prefix so Gemini reads raw PDF payload
       const basePdfParts: any[] = [];
       if (pdfBase64 && typeof pdfBase64 === "string" && pdfBase64.length > 50) {
         const cleanBase64 = pdfBase64.includes(",") 
@@ -121,7 +120,7 @@ async function startServer() {
           }
         });
       } else {
-        console.warn("[WARN] Invalid or empty PDF base64 string provided.");
+        console.warn("[WARN] Invalid or empty PDF base64 provided in payload.");
       }
 
       const batchSize = requestedTotal <= 25 ? requestedTotal : 25;
@@ -136,7 +135,7 @@ async function startServer() {
 
       const generateBatch = async (bCount: number, batchIdx: number): Promise<any[]> => {
         if (Date.now() < quotaExhaustedUntil) {
-          console.warn(`[WARN] Quota active. Using fallback questions for batch ${batchIdx + 1}.`);
+          console.warn(`[WARN] Quota exhausted. Skipping API call for batch ${batchIdx + 1} and using fallback.`);
           return getResilientReasoningQuestions(bCount);
         }
 
@@ -230,11 +229,11 @@ Return ONLY a JSON array adhering strictly to the schema.`;
       for (let i = 0; i < batchCounts.length; i++) {
         if (i > 0) {
           if (Date.now() < quotaExhaustedUntil) {
-            console.log(`[INFO] Quota active. Immediately serving fallback for batch ${i + 1}`);
+            console.log(`[INFO] Quota active. Immediately serving fallback for remaining batch ${i + 1}`);
             allResults.push(...getResilientReasoningQuestions(batchCounts[i]));
             continue;
           }
-          console.log(`[INFO] Pacing request... waiting 2s before batch ${i + 1}`);
+          console.log(`[INFO] Pacing request... waiting 2s before requesting batch ${i + 1}`);
           await sleep(2000);
         }
         const batchQuestions = await generateBatch(batchCounts[i], i);
@@ -619,7 +618,6 @@ Strict Requirements:
           tabSwitchesCount: typeof tabSwitchesCount === 'number' ? tabSwitchesCount : undefined,
           isAutoSubmitted: Boolean(isAutoSubmitted),
           score: typeof score === 'number' ? score : undefined,
-          maxScore: typeof maxScore === 'number' ? maxScore : undefined,
           percentage: typeof percentage === 'number' ? percentage : undefined,
           userAnswers
         }
