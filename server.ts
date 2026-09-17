@@ -25,34 +25,48 @@ function getAIClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Helper to pause execution
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Controlled retry logic that avoids Render's 60-second HTTP proxy timeout
+// Helper to check if error is rate limit / quota exhaustion
+function isQuotaOrRateLimitError(err: any): boolean {
+  if (!err) return false;
+  const status = err.status || err.code || err.error?.code;
+  const msg = (err.message || err.error?.message || "").toLowerCase();
+  return (
+    status === 429 ||
+    status === "RESOURCE_EXHAUSTED" ||
+    msg.includes("quota") ||
+    msg.includes("rate limit") ||
+    msg.includes("resource_exhausted") ||
+    msg.includes("exceeded your current quota")
+  );
+}
+
+// Controlled retry logic that respects Render's 60-second HTTP proxy timeout
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await ai.models.generateContent({ ...params, model: "gemini-3.6-flash" });
     } catch (err: any) {
-      const errStr = (err?.message || "").toLowerCase();
-      const is429 = err?.status === 429 || errStr.includes("quota") || errStr.includes("rate") || errStr.includes("resource_exhausted");
+      const errStr = (err?.message || err?.error?.message || "").toLowerCase();
+      const is429 = isQuotaOrRateLimitError(err);
       const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
 
       if ((is429 || is503) && attempt < maxRetries) {
-        let waitMs = 8000; // Default fast 8s delay
+        let waitMs = 8000;
 
         const match = errStr.match(/retry in ([0-9.]+)s/);
         if (match && match[1]) {
           const reqWaitSec = parseFloat(match[1]);
-          // If Google demands more than 20 seconds, abort wait to prevent Render 60s gateway timeout
-          if (reqWaitSec > 20) {
+          // Abort wait if Google demands > 15s to keep request safe from Render 60s timeout
+          if (reqWaitSec > 15) {
             console.warn(`[WARN] Required wait (${reqWaitSec}s) exceeds safe threshold. Triggering fallback.`);
             throw err;
           }
           waitMs = Math.ceil(reqWaitSec * 1000) + 1000;
         }
 
-        console.warn(`[WARN] API busy/rate-limited (${err?.status || '429'}). Pausing ${Math.ceil(waitMs / 1000)}s before retry ${attempt + 1}/${maxRetries}...`);
+        console.warn(`[WARN] API busy/rate-limited. Pausing ${Math.ceil(waitMs / 1000)}s before retry ${attempt + 1}/${maxRetries}...`);
         await sleep(waitMs);
       } else {
         throw err;
@@ -83,7 +97,7 @@ async function startServer() {
 
     try {
       if (!process.env.GEMINI_API_KEY) {
-        console.warn("[WARN] GEMINI_API_KEY missing. Using fallback bank.");
+        console.warn("[WARN] GEMINI_API_KEY missing. Serving fallback bank.");
         const fallbackQs = getResilientReasoningQuestions(requestedTotal);
         return res.json({ success: true, questions: fallbackQs, isFallback: true });
       }
@@ -106,11 +120,8 @@ async function startServer() {
             data: cleanBase64
           }
         });
-      } else {
-        console.warn("[WARN] No valid PDF base64 payload provided in request.");
       }
 
-      // Batch size configured to 25 to reduce overall API requests
       const batchSize = requestedTotal <= 25 ? requestedTotal : 25;
       const totalBatches = Math.ceil(requestedTotal / batchSize);
       const batchCounts: number[] = [];
@@ -122,6 +133,11 @@ async function startServer() {
       }
 
       const generateBatch = async (bCount: number, batchIdx: number): Promise<any[]> => {
+        if (Date.now() < quotaExhaustedUntil) {
+          console.warn(`[WARN] Quota exhausted. Skipping API request for batch ${batchIdx + 1} and using fallback.`);
+          return getResilientReasoningQuestions(bCount);
+        }
+
         const randomEntropyKey = `SESSION_${timestamp}_VARIATION_${seed}_BATCH_${batchIdx + 1}_RND_${Math.floor(Math.random() * 1000000)}`;
 
         const instructions = `You are a Master Professor of Formal Logic, Analytical Aptitude, and NIELIT 'O' Level Examination Question Setter.
@@ -191,9 +207,9 @@ Return ONLY a JSON array adhering strictly to the schema.`;
           });
         } catch (err: any) {
           console.error(`[ERROR] Gemini generation failed for batch ${batchIdx + 1}:`, err?.message || err);
-          const errStr = (err?.message || "").toLowerCase();
-          if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota")) {
-            quotaExhaustedUntil = Date.now() + 45 * 1000; // 45s cooldown
+          if (isQuotaOrRateLimitError(err)) {
+            quotaExhaustedUntil = Date.now() + 60 * 1000; // Trigger 60s cooldown across all batches
+            console.warn(`[WARN] Quota cooldown set until ${new Date(quotaExhaustedUntil).toLocaleTimeString()}`);
           }
           return getResilientReasoningQuestions(bCount);
         }
@@ -211,10 +227,14 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         }
       };
 
-      // Sequential execution with a 3s pause between calls
       const allResults: any[] = [];
       for (let i = 0; i < batchCounts.length; i++) {
         if (i > 0) {
+          if (Date.now() < quotaExhaustedUntil) {
+            console.log(`[INFO] Quota active. Immediately serving fallback for remaining batch ${i + 1}`);
+            allResults.push(...getResilientReasoningQuestions(batchCounts[i]));
+            continue;
+          }
           console.log(`[INFO] Pacing request... waiting 3s before requesting batch ${i + 1}`);
           await sleep(3000);
         }
@@ -253,24 +273,30 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         });
       }
 
+      if (Date.now() < quotaExhaustedUntil) {
+        return res.status(429).json({
+          error: "API quota active. Please try again shortly.",
+          fallbackAvailable: true
+        });
+      }
+
       const ai = getAIClient();
-      const prompt = `You are a Senior Question Paper Setter for NIELIT (National Institute of Electronics and Information Technology) for the 'O Level' examination (Revision 5.1).
-Generate ${count} authentic, exam-quality Multiple Choice Questions (MCQs) for:
+      const prompt = `You are a Senior Question Paper Setter for NIELIT for 'O Level' (Revision 5.1).
+Generate ${count} authentic MCQs for:
 Module: ${moduleCode} - ${moduleTitle}
 Chapter/Topic: ${chapterName} ${topic ? `(Focus: ${topic})` : ''}
 
 Strict Requirements:
 1. Each question must have:
    - questionEn: English question text
-   - questionHi: Hindi translation of the question
+   - questionHi: Hindi translation
    - optionsEn: Array of 4 English options [A, B, C, D]
    - optionsHi: Array of 4 Hindi options [A, B, C, D]
-   - correctIndex: 0, 1, 2, or 3 representing the index of the correct option
-   - explanationEn: Detailed explanation in English citing standard facts
-   - explanationHi: Detailed explanation in Hindi
+   - correctIndex: 0, 1, 2, or 3
+   - explanationEn: Detailed English explanation
+   - explanationHi: Detailed Hindi explanation
    - difficulty: "easy", "medium", or "hard"
-2. Questions must be strictly based on the official NIELIT O Level R5.1 curriculum (like Examjila and official NIELIT previous year papers).
-3. Do NOT make trick questions with ambiguous answers. Return only valid JSON adhering to the schema.`;
+2. Questions must adhere strictly to NIELIT O Level R5.1 curriculum. Return valid JSON adhering to the schema.`;
 
       const response = await generateWithRetry(ai, {
         contents: prompt,
@@ -306,6 +332,9 @@ Strict Requirements:
       return res.json({ success: true, questions: parsed });
     } catch (error: any) {
       console.error("Error generating AI questions:", error);
+      if (isQuotaOrRateLimitError(error)) {
+        quotaExhaustedUntil = Date.now() + 60 * 1000;
+      }
       return res.status(500).json({ error: error.message || "Failed to generate questions" });
     }
   });
