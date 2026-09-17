@@ -7,8 +7,8 @@ import { liveTestStore } from "./server/liveTestManager.js";
 let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
-// Primary model for generation with high free-tier limits
-const MODEL_NAME = "gemini-1.5-flash";
+// Correct model identifier for modern @google/genai SDK
+const MODEL_NAME = "gemini-2.5-flash";
 
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
