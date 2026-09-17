@@ -25,31 +25,37 @@ function getAIClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Helper function to retry model generation on 503 high-demand errors
+// Helper to pause execution for rate-limiting pacing
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Smart retry wrapper handling both 503 (High Demand) and 429 (Rate Limit) errors
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 3): Promise<any> {
-  let delay = 1000;
+  let delay = 3000; // Start with a 3-second delay
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await ai.models.generateContent(params);
     } catch (err: any) {
-      const is503 = err?.status === 503 || (err?.message && err.message.includes("503")) || (err?.message && err.message.includes("high demand"));
-      if (is503 && attempt < maxRetries) {
-        console.warn(`[WARN] 503 High Demand encountered. Retrying in ${delay}ms (Attempt ${attempt}/${maxRetries})...`);
-        await new Promise((res) => setTimeout(res, delay));
-        delay *= 2;
+      const errStr = (err?.message || "").toLowerCase();
+      const is429 = err?.status === 429 || errStr.includes("quota") || errStr.includes("rate") || errStr.includes("resource_exhausted");
+      const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
+
+      if ((is429 || is503) && attempt < maxRetries) {
+        console.warn(`[WARN] API Rate Limit / Demand spike (${err?.status || 'Error'}). Waiting ${delay / 1000}s before retry (Attempt ${attempt}/${maxRetries})...`);
+        await sleep(delay);
+        delay *= 2; // Exponential backoff
       } else {
         throw err;
       }
     }
   }
-  throw new Error("Failed after maximum retries due to 503 high demand.");
+  throw new Error("Failed after maximum retries due to rate limits or high demand.");
 }
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  // Increased body payload limits to 50MB for large PDF files
+  // 1. Increased body payload limits to 50MB for large PDF files
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -66,8 +72,16 @@ async function startServer() {
     console.log(`[DEBUG] Received PDF payload base64 length: ${pdfBase64 ? pdfBase64.length : 0}`);
 
     try {
-      if (!process.env.GEMINI_API_KEY || Date.now() < quotaExhaustedUntil) {
-        console.warn("[WARN] GEMINI_API_KEY missing or quota cooling down. Using fallback bank.");
+      if (!process.env.GEMINI_API_KEY) {
+        console.warn("[WARN] GEMINI_API_KEY missing. Using fallback bank.");
+        const fallbackQs = getResilientReasoningQuestions(requestedTotal);
+        return res.json({ success: true, questions: fallbackQs, isFallback: true });
+      }
+
+      // Check if global cooldown is active
+      if (Date.now() < quotaExhaustedUntil) {
+        const remainingMs = Math.ceil((quotaExhaustedUntil - Date.now()) / 1000);
+        console.warn(`[WARN] Quota cooling down for ${remainingMs}s. Serving fallback bank.`);
         const fallbackQs = getResilientReasoningQuestions(requestedTotal);
         return res.json({ success: true, questions: fallbackQs, isFallback: true });
       }
@@ -87,6 +101,7 @@ async function startServer() {
         console.warn("[WARN] No valid PDF base64 payload provided in request.");
       }
 
+      // Break request into batches of 15 questions each
       const batchSize = requestedTotal <= 15 ? requestedTotal : 15;
       const totalBatches = Math.ceil(requestedTotal / batchSize);
       const batchCounts: number[] = [];
@@ -98,10 +113,6 @@ async function startServer() {
       }
 
       const generateBatch = async (bCount: number, batchIdx: number): Promise<any[]> => {
-        if (Date.now() < quotaExhaustedUntil) {
-          return getResilientReasoningQuestions(bCount);
-        }
-
         const randomEntropyKey = `SESSION_${timestamp}_VARIATION_${seed}_BATCH_${batchIdx + 1}_RND_${Math.floor(Math.random() * 1000000)}`;
 
         const instructions = `You are a Master Professor of Formal Logic, Analytical Aptitude, and NIELIT 'O' Level Examination Question Setter.
@@ -132,11 +143,10 @@ MANDATORY DIVERSITY & VARIATION RULES:
 Return ONLY a JSON array adhering strictly to the schema.`;
 
         const contentsParts = [...basePdfParts, { text: instructions }];
-        
         let resp: any = null;
 
         try {
-          console.log(`[DEBUG] Requesting batch ${batchIdx + 1} with model: gemini-3.6-flash`);
+          console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches} with model: gemini-3.6-flash`);
           resp = await generateWithRetry(ai, {
             model: "gemini-3.6-flash",
             contents: {
@@ -174,8 +184,9 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         } catch (err: any) {
           console.error(`[ERROR] Gemini generation failed for batch ${batchIdx + 1}:`, err?.message || err);
           const errStr = (err?.message || "").toLowerCase();
-          if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota") || errStr.includes("rate")) {
-            quotaExhaustedUntil = Date.now() + 5 * 60 * 1000;
+          if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota")) {
+            // Set short 2-minute cooldown if persistent quota limits are hit
+            quotaExhaustedUntil = Date.now() + 2 * 60 * 1000;
           }
           return getResilientReasoningQuestions(bCount);
         }
@@ -193,17 +204,15 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         }
       };
 
+      // Execute batches Strictly Sequentially with a 2.5-second pause between requests to preserve API limits
       const allResults: any[] = [];
-      for (let i = 0; i < batchCounts.length; i += 2) {
-        const slice = batchCounts.slice(i, i + 2);
-        const batchPromises = slice.map((c, sIdx) => generateBatch(c, i + sIdx));
-        try {
-          const resolved = await Promise.all(batchPromises);
-          resolved.forEach(arr => allResults.push(...arr));
-        } catch {
-          const sliceTotal = slice.reduce((a, b) => a + b, 0);
-          allResults.push(...getResilientReasoningQuestions(sliceTotal));
+      for (let i = 0; i < batchCounts.length; i++) {
+        if (i > 0) {
+          console.log(`[INFO] Pacing request... waiting 2.5s before requesting batch ${i + 1}`);
+          await sleep(2500);
         }
+        const batchQuestions = await generateBatch(batchCounts[i], i);
+        allResults.push(...batchQuestions);
       }
 
       if (allResults.length < requestedTotal) {
