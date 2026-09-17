@@ -28,21 +28,29 @@ function getAIClient(): GoogleGenAI {
 // Helper to pause execution for rate-limiting pacing
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Smart retry wrapper handling both 503 (High Demand) and 429 (Rate Limit) errors
+// Robust retry wrapper parsing Google's actual retryDelay for 429 and 503 errors
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 3): Promise<any> {
-  let delay = 3000; // Start with a 3-second delay
+  const models = [params.model, "gemini-2.5-flash", "gemini-1.5-flash"];
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const currentModel = models[(attempt - 1) % models.length];
     try {
-      return await ai.models.generateContent(params);
+      return await ai.models.generateContent({ ...params, model: currentModel });
     } catch (err: any) {
       const errStr = (err?.message || "").toLowerCase();
       const is429 = err?.status === 429 || errStr.includes("quota") || errStr.includes("rate") || errStr.includes("resource_exhausted");
       const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
 
       if ((is429 || is503) && attempt < maxRetries) {
-        console.warn(`[WARN] API Rate Limit / Demand spike (${err?.status || 'Error'}). Waiting ${delay / 1000}s before retry (Attempt ${attempt}/${maxRetries})...`);
-        await sleep(delay);
-        delay *= 2; // Exponential backoff
+        // Extract required wait time from error payload if available, or default to 60 seconds for 429s
+        let waitMs = is429 ? 60000 : 5000 * attempt;
+        const match = errStr.match(/retry in ([0-9.]+)s/);
+        if (match && match[1]) {
+          waitMs = Math.ceil(parseFloat(match[1]) * 1000) + 2000;
+        }
+
+        console.warn(`[WARN] ${is429 ? "429 Rate Limit" : "503 High Demand"} on ${currentModel}. Waiting ${Math.ceil(waitMs / 1000)}s before attempt ${attempt + 1}/${maxRetries}...`);
+        await sleep(waitMs);
       } else {
         throw err;
       }
@@ -55,7 +63,6 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  // 1. Increased body payload limits to 50MB for large PDF files
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -78,7 +85,6 @@ async function startServer() {
         return res.json({ success: true, questions: fallbackQs, isFallback: true });
       }
 
-      // Check if global cooldown is active
       if (Date.now() < quotaExhaustedUntil) {
         const remainingMs = Math.ceil((quotaExhaustedUntil - Date.now()) / 1000);
         console.warn(`[WARN] Quota cooling down for ${remainingMs}s. Serving fallback bank.`);
@@ -101,8 +107,8 @@ async function startServer() {
         console.warn("[WARN] No valid PDF base64 payload provided in request.");
       }
 
-      // Break request into batches of 15 questions each
-      const batchSize = requestedTotal <= 15 ? requestedTotal : 15;
+      // Larger batch size = fewer total API requests per test creation
+      const batchSize = requestedTotal <= 25 ? requestedTotal : 25;
       const totalBatches = Math.ceil(requestedTotal / batchSize);
       const batchCounts: number[] = [];
       let rem = requestedTotal;
@@ -146,7 +152,7 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         let resp: any = null;
 
         try {
-          console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches} with model: gemini-3.6-flash`);
+          console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches}`);
           resp = await generateWithRetry(ai, {
             model: "gemini-3.6-flash",
             contents: {
@@ -185,8 +191,7 @@ Return ONLY a JSON array adhering strictly to the schema.`;
           console.error(`[ERROR] Gemini generation failed for batch ${batchIdx + 1}:`, err?.message || err);
           const errStr = (err?.message || "").toLowerCase();
           if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota")) {
-            // Set short 2-minute cooldown if persistent quota limits are hit
-            quotaExhaustedUntil = Date.now() + 2 * 60 * 1000;
+            quotaExhaustedUntil = Date.now() + 60 * 1000;
           }
           return getResilientReasoningQuestions(bCount);
         }
@@ -204,12 +209,12 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         }
       };
 
-      // Execute batches Strictly Sequentially with a 2.5-second pause between requests to preserve API limits
+      // Execute batches strictly sequentially with 5-second pacing delay
       const allResults: any[] = [];
       for (let i = 0; i < batchCounts.length; i++) {
         if (i > 0) {
-          console.log(`[INFO] Pacing request... waiting 2.5s before requesting batch ${i + 1}`);
-          await sleep(2500);
+          console.log(`[INFO] Pacing request... waiting 5s before requesting batch ${i + 1}`);
+          await sleep(5000);
         }
         const batchQuestions = await generateBatch(batchCounts[i], i);
         allResults.push(...batchQuestions);
