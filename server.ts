@@ -25,38 +25,41 @@ function getAIClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Helper to pause execution for rate-limiting pacing
+// Helper to pause execution
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Robust retry wrapper parsing Google's actual retryDelay for 429 and 503 errors
-async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 3): Promise<any> {
-  const models = [params.model, "gemini-2.5-flash", "gemini-1.5-flash"];
-
+// Controlled retry logic that avoids Render's 60-second HTTP proxy timeout
+async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const currentModel = models[(attempt - 1) % models.length];
     try {
-      return await ai.models.generateContent({ ...params, model: currentModel });
+      return await ai.models.generateContent({ ...params, model: "gemini-3.6-flash" });
     } catch (err: any) {
       const errStr = (err?.message || "").toLowerCase();
       const is429 = err?.status === 429 || errStr.includes("quota") || errStr.includes("rate") || errStr.includes("resource_exhausted");
       const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
 
       if ((is429 || is503) && attempt < maxRetries) {
-        // Extract required wait time from error payload if available, or default to 60 seconds for 429s
-        let waitMs = is429 ? 60000 : 5000 * attempt;
+        let waitMs = 8000; // Default fast 8s delay
+
         const match = errStr.match(/retry in ([0-9.]+)s/);
         if (match && match[1]) {
-          waitMs = Math.ceil(parseFloat(match[1]) * 1000) + 2000;
+          const reqWaitSec = parseFloat(match[1]);
+          // If Google demands more than 20 seconds, abort wait to prevent Render 60s gateway timeout
+          if (reqWaitSec > 20) {
+            console.warn(`[WARN] Required wait (${reqWaitSec}s) exceeds safe threshold. Triggering fallback.`);
+            throw err;
+          }
+          waitMs = Math.ceil(reqWaitSec * 1000) + 1000;
         }
 
-        console.warn(`[WARN] ${is429 ? "429 Rate Limit" : "503 High Demand"} on ${currentModel}. Waiting ${Math.ceil(waitMs / 1000)}s before attempt ${attempt + 1}/${maxRetries}...`);
+        console.warn(`[WARN] API busy/rate-limited (${err?.status || '429'}). Pausing ${Math.ceil(waitMs / 1000)}s before retry ${attempt + 1}/${maxRetries}...`);
         await sleep(waitMs);
       } else {
         throw err;
       }
     }
   }
-  throw new Error("Failed after maximum retries due to rate limits or high demand.");
+  throw new Error("Failed after retries.");
 }
 
 async function startServer() {
@@ -107,7 +110,7 @@ async function startServer() {
         console.warn("[WARN] No valid PDF base64 payload provided in request.");
       }
 
-      // Larger batch size = fewer total API requests per test creation
+      // Batch size configured to 25 to reduce overall API requests
       const batchSize = requestedTotal <= 25 ? requestedTotal : 25;
       const totalBatches = Math.ceil(requestedTotal / batchSize);
       const batchCounts: number[] = [];
@@ -154,7 +157,6 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         try {
           console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches}`);
           resp = await generateWithRetry(ai, {
-            model: "gemini-3.6-flash",
             contents: {
               parts: contentsParts
             },
@@ -191,7 +193,7 @@ Return ONLY a JSON array adhering strictly to the schema.`;
           console.error(`[ERROR] Gemini generation failed for batch ${batchIdx + 1}:`, err?.message || err);
           const errStr = (err?.message || "").toLowerCase();
           if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota")) {
-            quotaExhaustedUntil = Date.now() + 60 * 1000;
+            quotaExhaustedUntil = Date.now() + 45 * 1000; // 45s cooldown
           }
           return getResilientReasoningQuestions(bCount);
         }
@@ -209,12 +211,12 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         }
       };
 
-      // Execute batches strictly sequentially with 5-second pacing delay
+      // Sequential execution with a 3s pause between calls
       const allResults: any[] = [];
       for (let i = 0; i < batchCounts.length; i++) {
         if (i > 0) {
-          console.log(`[INFO] Pacing request... waiting 5s before requesting batch ${i + 1}`);
-          await sleep(5000);
+          console.log(`[INFO] Pacing request... waiting 3s before requesting batch ${i + 1}`);
+          await sleep(3000);
         }
         const batchQuestions = await generateBatch(batchCounts[i], i);
         allResults.push(...batchQuestions);
@@ -271,7 +273,6 @@ Strict Requirements:
 3. Do NOT make trick questions with ambiguous answers. Return only valid JSON adhering to the schema.`;
 
       const response = await generateWithRetry(ai, {
-        model: "gemini-3.6-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
