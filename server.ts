@@ -110,15 +110,21 @@ async function startServer() {
 
       const ai = getAIClient();
 
+      // Clean base64 extraction to isolate pure PDF data for Gemini API
       const basePdfParts: any[] = [];
       if (pdfBase64 && typeof pdfBase64 === "string" && pdfBase64.length > 50) {
-        const cleanBase64 = pdfBase64.replace(/^data:application\/pdf;base64,/, "");
+        const cleanBase64 = pdfBase64.includes(",") 
+          ? pdfBase64.split(",")[1] 
+          : pdfBase64;
+
         basePdfParts.push({
           inlineData: {
             mimeType: "application/pdf",
-            data: cleanBase64
+            data: cleanBase64.trim()
           }
         });
+      } else {
+        console.warn("[WARN] Invalid or empty PDF base64 provided in payload.");
       }
 
       const batchSize = requestedTotal <= 25 ? requestedTotal : 25;
