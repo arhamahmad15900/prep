@@ -27,10 +27,11 @@ function getAIClient(): GoogleGenAI {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: "30mb" }));
-  app.use(express.urlencoded({ limit: "30mb", extended: true }));
+  // 1. Increased body payload limits to 50MB for large PDF files
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // Health check
   app.get("/api/health", (_req, res) => {
@@ -42,9 +43,13 @@ async function startServer() {
     const { pdfBase64, count = 50, timestamp = Date.now(), seed = Math.random().toString() } = req.body;
     const requestedTotal = Math.min(Math.max(Number(count) || 10, 5), 100);
 
+    // 2. Debug payload length
+    console.log(`[DEBUG] Received PDF payload base64 length: ${pdfBase64 ? pdfBase64.length : 0}`);
+
     try {
       // If Gemini key is missing or quota was recently exhausted, serve resilient reasoning MCQs instantly
       if (!process.env.GEMINI_API_KEY || Date.now() < quotaExhaustedUntil) {
+        console.warn("[WARN] GEMINI_API_KEY missing or quota cooling down. Using fallback bank.");
         const fallbackQs = getResilientReasoningQuestions(requestedTotal);
         return res.json({ success: true, questions: fallbackQs, isFallback: true });
       }
@@ -60,6 +65,8 @@ async function startServer() {
             data: cleanBase64
           }
         });
+      } else {
+        console.warn("[WARN] No valid PDF base64 payload provided in request.");
       }
 
       // Fast, manageable batch size of 15 Qs per batch
@@ -108,11 +115,14 @@ MANDATORY DIVERSITY & VARIATION RULES:
 Return ONLY a JSON array adhering strictly to the schema.`;
 
         const contentsParts = [...basePdfParts, { text: instructions }];
-        const modelsToTry = ["gemini-3.8-flash", "gemini-3.1-flash-lite"];
+        
+        // 3. Updated active Gemini production models
+        const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash"];
         let resp: any = null;
 
         for (const modelName of modelsToTry) {
           try {
+            console.log(`[DEBUG] Requesting batch ${batchIdx + 1} with model: ${modelName}`);
             resp = await ai.models.generateContent({
               model: modelName,
               contents: {
@@ -149,6 +159,7 @@ Return ONLY a JSON array adhering strictly to the schema.`;
             });
             if (resp && resp.text) break;
           } catch (err: any) {
+            console.error(`[ERROR] Gemini generation failed with model ${modelName}:`, err?.message || err);
             const errStr = (err?.message || "").toLowerCase();
             if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota") || errStr.includes("rate")) {
               quotaExhaustedUntil = Date.now() + 5 * 60 * 1000;
@@ -158,6 +169,7 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         }
 
         if (!resp || !resp.text) {
+          console.warn(`[WARN] Empty response from Gemini for batch ${batchIdx + 1}. Serving fallback.`);
           return getResilientReasoningQuestions(bCount);
         }
 
@@ -178,13 +190,11 @@ Return ONLY a JSON array adhering strictly to the schema.`;
           const resolved = await Promise.all(batchPromises);
           resolved.forEach(arr => allResults.push(...arr));
         } catch {
-          // If any batch error, fulfill with resilient bank
           const sliceTotal = slice.reduce((a, b) => a + b, 0);
           allResults.push(...getResilientReasoningQuestions(sliceTotal));
         }
       }
 
-      // If partial results were obtained, fill remaining to requestedTotal
       if (allResults.length < requestedTotal) {
         const needed = requestedTotal - allResults.length;
         const fillQs = getResilientReasoningQuestions(needed);
@@ -194,7 +204,6 @@ Return ONLY a JSON array adhering strictly to the schema.`;
       return res.json({ success: true, questions: allResults });
     } catch (error: any) {
       console.error("Error generating reasoning questions from PDF:", error);
-      // Ensure the user never gets an unusable screen by returning verified O-Level Reasoning MCQs
       const fallbackQs = getResilientReasoningQuestions(requestedTotal);
       return res.json({
         success: true,
@@ -237,7 +246,7 @@ Strict Requirements:
 3. Do NOT make trick questions with ambiguous answers. Return only valid JSON adhering to the schema.`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: "gemini-2.5-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -279,7 +288,6 @@ Strict Requirements:
   // HOST & JOIN LIVE TEST SESSION ENDPOINTS
   // ==========================================
 
-  // 1. Host creates a live test server
   app.post("/api/live-tests/create", (req, res) => {
     try {
       const {
@@ -359,7 +367,6 @@ Strict Requirements:
     }
   });
 
-  // 2. Student joins a live test session
   app.post("/api/live-tests/:testId/join", (req, res) => {
     try {
       const { testId } = req.params;
@@ -394,7 +401,6 @@ Strict Requirements:
           broadcastTime: result.session.broadcastTime,
           showImmediateResults: result.session.showImmediateResults,
           negativeMarking: result.session.negativeMarking,
-          // Only send questions if test has started
           questions: result.session.status === "in_progress" ? result.session.questions : []
         }
       });
@@ -404,7 +410,6 @@ Strict Requirements:
     }
   });
 
-  // 3. Poll session status & student roster
   app.get("/api/live-tests/:testId/session", (req, res) => {
     try {
       const { testId } = req.params;
@@ -446,7 +451,6 @@ Strict Requirements:
         });
       }
 
-      // Safe view for students
       const student = studentId ? session.students[String(studentId)] : null;
       const studentSummaryList = Object.values(session.students).map(s => ({
         id: s.id,
@@ -475,7 +479,6 @@ Strict Requirements:
           negativeMarking: session.negativeMarking,
           students: studentSummaryList,
           myStudentStatus: student ? student.status : null,
-          // Only send actual questions once the test has been officially started by the host!
           questions: session.status === "in_progress" || session.status === "ended" ? session.questions : []
         }
       });
@@ -484,7 +487,6 @@ Strict Requirements:
     }
   });
 
-  // 4. Host starts the test (students automatically begin)
   app.post("/api/live-tests/:testId/start", (req, res) => {
     try {
       const { testId } = req.params;
@@ -505,7 +507,6 @@ Strict Requirements:
     }
   });
 
-  // 5. Student sends live answering progress
   app.post("/api/live-tests/:testId/progress", (req, res) => {
     try {
       const { testId } = req.params;
@@ -524,7 +525,6 @@ Strict Requirements:
     }
   });
 
-  // 6. Student submits their test
   app.post("/api/live-tests/:testId/submit", (req, res) => {
     try {
       const { testId } = req.params;
@@ -544,7 +544,6 @@ Strict Requirements:
     }
   });
 
-  // 6b. Student logs proctoring infraction / event (tab switch, window blur, browser close, auto-submit)
   app.post("/api/live-tests/:testId/proctor-event", (req, res) => {
     try {
       const { testId } = req.params;
@@ -578,7 +577,6 @@ Strict Requirements:
     }
   });
 
-  // 7. Host ends test for everyone
   app.post("/api/live-tests/:testId/end", (req, res) => {
     try {
       const { testId } = req.params;
@@ -594,7 +592,6 @@ Strict Requirements:
     }
   });
 
-  // 8. Host kicks/removes a student
   app.post("/api/live-tests/:testId/kick", (req, res) => {
     try {
       const { testId } = req.params;
@@ -607,7 +604,6 @@ Strict Requirements:
     }
   });
 
-  // 9. Host broadcasts message to all students
   app.post("/api/live-tests/:testId/broadcast", (req, res) => {
     try {
       const { testId } = req.params;
@@ -620,7 +616,6 @@ Strict Requirements:
     }
   });
 
-  // 10. Host updates session settings (e.g. toggle immediate candidate results, late joining)
   app.post("/api/live-tests/:testId/settings", (req, res) => {
     try {
       const { testId } = req.params;
@@ -636,7 +631,6 @@ Strict Requirements:
     }
   });
 
-  // 10. Host deletes/closes a session
   app.delete("/api/live-tests/:testId", (req, res) => {
     try {
       const { testId } = req.params;
@@ -649,7 +643,7 @@ Strict Requirements:
     }
   });
 
-  // Vite middleware for development
+  // Vite middleware for development vs static build for production
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
