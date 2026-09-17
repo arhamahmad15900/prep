@@ -8,7 +8,7 @@ let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
 // Set model targets
-const PRIMARY_MODEL = "gemini-3.8-flash";
+const PRIMARY_MODEL = "gemini-2.0-flash";
 const FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash"];
 
 function getAIClient(): GoogleGenAI {
