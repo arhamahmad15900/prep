@@ -7,8 +7,9 @@ import { liveTestStore } from "./server/liveTestManager.js";
 let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
-// Correct model identifier for modern @google/genai SDK
-const MODEL_NAME = "gemini-2.5-flash";
+// Model resilience hierarchy
+const PRIMARY_MODEL = "gemini-3.6-flash";
+const FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash-8b"];
 
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
@@ -44,37 +45,33 @@ function isQuotaOrRateLimitError(err: any): boolean {
   );
 }
 
-// Retries API calls up to 2 times, avoiding Render's 60-second HTTP proxy timeout
+// Retries primary model, then cascades to available fallback models on rate limits
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await ai.models.generateContent({ ...params, model: MODEL_NAME });
-    } catch (err: any) {
-      const errStr = (err?.message || err?.error?.message || "").toLowerCase();
-      const is429 = isQuotaOrRateLimitError(err);
-      const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
+  const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
 
-      if ((is429 || is503) && attempt < maxRetries) {
-        let waitMs = 5000;
+  for (const modelName of modelsToTry) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`[DEBUG] Attempting generation with model: ${modelName} (Attempt ${attempt})`);
+        return await ai.models.generateContent({ ...params, model: modelName });
+      } catch (err: any) {
+        const errStr = (err?.message || err?.error?.message || "").toLowerCase();
+        const is429 = isQuotaOrRateLimitError(err);
+        const is503 = err?.status === 503 || errStr.includes("503") || errStr.includes("high demand");
 
-        const match = errStr.match(/retry in ([0-9.]+)s/);
-        if (match && match[1]) {
-          const reqWaitSec = parseFloat(match[1]);
-          if (reqWaitSec > 15) {
-            console.warn(`[WARN] Required wait (${reqWaitSec}s) exceeds safe threshold. Triggering fallback.`);
-            throw err;
-          }
-          waitMs = Math.ceil(reqWaitSec * 1000) + 1000;
+        if ((is429 || is503) && attempt < maxRetries) {
+          console.warn(`[WARN] Model ${modelName} rate limited. Retrying...`);
+          await sleep(2000);
+        } else if (is429 || is503) {
+          console.warn(`[WARN] Quota exhausted on ${modelName}. Cascading to fallback model...`);
+          break; // Try next model in sequence
+        } else {
+          throw err;
         }
-
-        console.warn(`[WARN] API rate-limited (${MODEL_NAME}). Waiting ${Math.ceil(waitMs / 1000)}s before retry ${attempt + 1}/${maxRetries}...`);
-        await sleep(waitMs);
-      } else {
-        throw err;
       }
     }
   }
-  throw new Error("Failed after retries.");
+  throw new Error("All AI models failed or exceeded quota limits.");
 }
 
 async function startServer() {
@@ -110,7 +107,6 @@ async function startServer() {
 
       const ai = getAIClient();
 
-      // Clean base64 extraction to isolate pure PDF data for Gemini API
       const basePdfParts: any[] = [];
       if (pdfBase64 && typeof pdfBase64 === "string" && pdfBase64.length > 50) {
         const cleanBase64 = pdfBase64.includes(",") 
@@ -176,7 +172,6 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         let resp: any = null;
 
         try {
-          console.log(`[DEBUG] Requesting batch ${batchIdx + 1}/${totalBatches} with model: ${MODEL_NAME}`);
           resp = await generateWithRetry(ai, {
             contents: { parts: contentsParts },
             config: {
