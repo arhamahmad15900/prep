@@ -25,11 +25,31 @@ function getAIClient(): GoogleGenAI {
   return aiClient;
 }
 
+// Helper function to retry model generation on 503 high-demand errors
+async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 3): Promise<any> {
+  let delay = 1000;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err: any) {
+      const is503 = err?.status === 503 || (err?.message && err.message.includes("503")) || (err?.message && err.message.includes("high demand"));
+      if (is503 && attempt < maxRetries) {
+        console.warn(`[WARN] 503 High Demand encountered. Retrying in ${delay}ms (Attempt ${attempt}/${maxRetries})...`);
+        await new Promise((res) => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("Failed after maximum retries due to 503 high demand.");
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  // 1. Increased body payload limits to 50MB for large PDF files
+  // Increased body payload limits to 50MB for large PDF files
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -43,11 +63,9 @@ async function startServer() {
     const { pdfBase64, count = 50, timestamp = Date.now(), seed = Math.random().toString() } = req.body;
     const requestedTotal = Math.min(Math.max(Number(count) || 10, 5), 100);
 
-    // 2. Debug payload length
     console.log(`[DEBUG] Received PDF payload base64 length: ${pdfBase64 ? pdfBase64.length : 0}`);
 
     try {
-      // If Gemini key is missing or quota was recently exhausted, serve resilient reasoning MCQs instantly
       if (!process.env.GEMINI_API_KEY || Date.now() < quotaExhaustedUntil) {
         console.warn("[WARN] GEMINI_API_KEY missing or quota cooling down. Using fallback bank.");
         const fallbackQs = getResilientReasoningQuestions(requestedTotal);
@@ -69,7 +87,6 @@ async function startServer() {
         console.warn("[WARN] No valid PDF base64 payload provided in request.");
       }
 
-      // Fast, manageable batch size of 15 Qs per batch
       const batchSize = requestedTotal <= 15 ? requestedTotal : 15;
       const totalBatches = Math.ceil(requestedTotal / batchSize);
       const batchCounts: number[] = [];
@@ -116,56 +133,51 @@ Return ONLY a JSON array adhering strictly to the schema.`;
 
         const contentsParts = [...basePdfParts, { text: instructions }];
         
-        // Robust multi-model fallback list to guarantee uptime under high demand
-        const modelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash"];
         let resp: any = null;
 
-        for (const modelName of modelsToTry) {
-          try {
-            console.log(`[DEBUG] Requesting batch ${batchIdx + 1} with model: ${modelName}`);
-            resp = await ai.models.generateContent({
-              model: modelName,
-              contents: {
-                parts: contentsParts
-              },
-              config: {
-                temperature: 0.9,
-                responseMimeType: "application/json",
-                responseSchema: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      questionEn: { type: Type.STRING },
-                      questionHi: { type: Type.STRING },
-                      optionsEn: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING }
-                      },
-                      optionsHi: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING }
-                      },
-                      correctIndex: { type: Type.INTEGER },
-                      explanationEn: { type: Type.STRING },
-                      explanationHi: { type: Type.STRING },
-                      topic: { type: Type.STRING },
-                      difficulty: { type: Type.STRING }
+        try {
+          console.log(`[DEBUG] Requesting batch ${batchIdx + 1} with model: gemini-3.6-flash`);
+          resp = await generateWithRetry(ai, {
+            model: "gemini-3.6-flash",
+            contents: {
+              parts: contentsParts
+            },
+            config: {
+              temperature: 0.9,
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    questionEn: { type: Type.STRING },
+                    questionHi: { type: Type.STRING },
+                    optionsEn: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
                     },
-                    required: ["questionEn", "optionsEn", "correctIndex", "explanationEn", "optionsHi", "questionHi"]
-                  }
+                    optionsHi: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
+                    },
+                    correctIndex: { type: Type.INTEGER },
+                    explanationEn: { type: Type.STRING },
+                    explanationHi: { type: Type.STRING },
+                    topic: { type: Type.STRING },
+                    difficulty: { type: Type.STRING }
+                  },
+                  required: ["questionEn", "optionsEn", "correctIndex", "explanationEn", "optionsHi", "questionHi"]
                 }
               }
-            });
-            if (resp && resp.text) break;
-          } catch (err: any) {
-            console.error(`[ERROR] Gemini generation failed with model ${modelName}:`, err?.message || err);
-            const errStr = (err?.message || "").toLowerCase();
-            if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota") || errStr.includes("rate")) {
-              quotaExhaustedUntil = Date.now() + 5 * 60 * 1000;
-              return getResilientReasoningQuestions(bCount);
             }
+          });
+        } catch (err: any) {
+          console.error(`[ERROR] Gemini generation failed for batch ${batchIdx + 1}:`, err?.message || err);
+          const errStr = (err?.message || "").toLowerCase();
+          if (err?.status === "RESOURCE_EXHAUSTED" || errStr.includes("429") || errStr.includes("quota") || errStr.includes("rate")) {
+            quotaExhaustedUntil = Date.now() + 5 * 60 * 1000;
           }
+          return getResilientReasoningQuestions(bCount);
         }
 
         if (!resp || !resp.text) {
@@ -181,7 +193,6 @@ Return ONLY a JSON array adhering strictly to the schema.`;
         }
       };
 
-      // Run batches with concurrency control (2 concurrent requests)
       const allResults: any[] = [];
       for (let i = 0; i < batchCounts.length; i += 2) {
         const slice = batchCounts.slice(i, i + 2);
@@ -245,8 +256,8 @@ Strict Requirements:
 2. Questions must be strictly based on the official NIELIT O Level R5.1 curriculum (like Examjila and official NIELIT previous year papers).
 3. Do NOT make trick questions with ambiguous answers. Return only valid JSON adhering to the schema.`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+      const response = await generateWithRetry(ai, {
+        model: "gemini-3.6-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -643,7 +654,6 @@ Strict Requirements:
     }
   });
 
-  // Vite middleware for development vs static build for production
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
