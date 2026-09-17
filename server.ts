@@ -116,8 +116,8 @@ Return ONLY a JSON array adhering strictly to the schema.`;
 
         const contentsParts = [...basePdfParts, { text: instructions }];
         
-        // Updated active Gemini production models
-        const modelsToTry = ["gemini-2.0-flash", "gemini-1.5-flash-latest"];
+        // Active production Gemini Flash model
+        const modelsToTry = ["gemini-3.6-flash"];
         let resp: any = null;
 
         for (const modelName of modelsToTry) {
@@ -246,7 +246,7 @@ Strict Requirements:
 3. Do NOT make trick questions with ambiguous answers. Return only valid JSON adhering to the schema.`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
+        model: "gemini-3.6-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
