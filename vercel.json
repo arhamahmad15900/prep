@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://prep-xqoj.onrender.com/api/:path*"
+    }
+  ]
+}
