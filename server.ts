@@ -7,9 +7,9 @@ import { liveTestStore } from "./server/liveTestManager.js";
 let aiClient: GoogleGenAI | null = null;
 let quotaExhaustedUntil = 0;
 
-// Set model targets
-const PRIMARY_MODEL = "gemini-1.5-flash";
-const FALLBACK_MODELS = ["gemini-1.5-flash-8b"];
+// Set model targets with gemini-1.5-pro as fallback
+const PRIMARY_MODEL = "gemini-3.6-flash";
+const FALLBACK_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash-8b"];
 
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
@@ -19,7 +19,6 @@ function getAIClient(): GoogleGenAI {
     }
     aiClient = new GoogleGenAI({
       apiKey,
-      apiVersion:'v1beta',
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
@@ -46,7 +45,7 @@ function isQuotaOrRateLimitError(err: any): boolean {
   );
 }
 
-// Retries primary model (gemini-1.5-flash) and falls back to backup models on quota errors
+// Retries primary model (gemini-3.6-flash) and falls back to gemini-1.5-pro on quota errors
 async function generateWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
   const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
 
@@ -619,6 +618,7 @@ Strict Requirements:
           tabSwitchesCount: typeof tabSwitchesCount === 'number' ? tabSwitchesCount : undefined,
           isAutoSubmitted: Boolean(isAutoSubmitted),
           score: typeof score === 'number' ? score : undefined,
+          maxScore: typeof maxScore === 'number' ? maxScore : undefined,
           percentage: typeof percentage === 'number' ? percentage : undefined,
           userAnswers
         }
